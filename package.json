@@ -1,0 +1,12 @@
+{
+  "name": "screenforge-ai-root",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ScreenForge AI - Text-Driven Screen Recorder & Video Editor",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "lint": "npm --prefix frontend run lint",
+    "test:backend": "backend\\.venv\\Scripts\\pytest -v backend\\tests"
+  }
+}
