@@ -19,12 +19,11 @@ app = FastAPI(
     version="0.2.0"
 )
 
-# Enable CORS for Next.js frontend and Render deployments
+# Enable universal CORS for Next.js frontend (Vercel, Render, localhost)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_origin_regex=r"https://.*(\.onrender\.com|\.vercel\.app)",
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
