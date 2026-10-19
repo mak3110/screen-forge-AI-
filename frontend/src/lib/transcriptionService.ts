@@ -9,16 +9,7 @@ export function getBackendUrl(): string {
     return "http://localhost:8000";
   }
 
-  let raw = (process.env.NEXT_PUBLIC_API_URL || "").trim();
-
-  // Strip accidental repeated protocols, spaces, and trailing slashes
-  raw = raw.replace(/^(https?:\/\/|\s)+/gi, "").replace(/\/+$/, "").trim();
-
-  if (raw && !raw.includes("localhost")) {
-    return `https://${raw}`;
-  }
-
-  // Live cloud fallback
+  // In cloud deployment (Vercel), connect to live Render backend
   return "https://screen-forge-ai.onrender.com";
 }
 
