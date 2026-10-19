@@ -29,6 +29,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "ScreenForge AI Backend",
+        "version": "0.2.0",
+        "docs_url": "/docs",
+        "health_url": "/api/health"
+    }
+
 @app.get("/api/health")
 async def health_check():
     return {
