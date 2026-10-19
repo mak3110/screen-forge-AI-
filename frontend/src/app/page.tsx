@@ -1,12 +1,14 @@
 "use client";
 
-import React, { useRef, useState, useEffect } from "react";
+import React, { useRef, useState, useEffect, useCallback } from "react";
 import { useScreenRecorder } from "@/hooks/useScreenRecorder";
 import { RecorderControls } from "@/components/RecorderControls";
 import { TranscriptGrid } from "@/components/TranscriptGrid";
+import { CutReviewPanel } from "@/components/CutReviewPanel";
+import { ExportModal } from "@/components/ExportModal";
 import { extract16kHzMonoWav } from "@/lib/audioProcessing";
-import { fetchTranscription } from "@/lib/transcriptionService";
-import { TranscriptState } from "@/types/transcript";
+import { fetchTranscription, fetchPlannedCuts } from "@/lib/transcriptionService";
+import { TranscriptState, CutCandidate } from "@/types/transcript";
 
 export default function ScreenForgeStudio() {
   const {
@@ -35,6 +37,14 @@ export default function ScreenForgeStudio() {
     error: null,
   });
 
+  // Cut schedule state (Steps 11-14)
+  const [cuts, setCuts] = useState<CutCandidate[]>([]);
+  const [isPlanningCuts, setIsPlanningCuts] = useState<boolean>(false);
+  const [skipNotification, setSkipNotification] = useState<string | null>(null);
+
+  // Export modal state (Steps 15-18)
+  const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
+
   // Audio extraction metrics
   const [extractedAudioSize, setExtractedAudioSize] = useState<number | null>(null);
 
@@ -48,10 +58,38 @@ export default function ScreenForgeStudio() {
   // Clean transcript when resetting
   const handleReset = () => {
     setTranscript({ words: [], isTranscribing: false, error: null });
+    setCuts([]);
     setExtractedAudioSize(null);
     setCurrentTime(0);
+    setSkipNotification(null);
     resetRecording();
   };
+
+  // Step 11 & 12: Request rules engine / AI cut planning
+  const handleScanForCuts = useCallback(async () => {
+    if (!recordedSession || transcript.words.length === 0) return;
+
+    setIsPlanningCuts(true);
+    try {
+      const planned = await fetchPlannedCuts(transcript.words, recordedSession.durationSeconds);
+      setCuts(planned);
+
+      // Synchronize cut flags on words
+      setTranscript((prev) => ({
+        ...prev,
+        words: prev.words.map((w) => {
+          const matchingCut = planned.find(
+            (c) => c.isApplied && w.start >= c.start - 0.05 && w.end <= c.end + 0.05
+          );
+          return matchingCut ? { ...w, isCut: true, cutReason: matchingCut.reason } : w;
+        }),
+      }));
+    } catch (err) {
+      console.error("Cut scanning error:", err);
+    } finally {
+      setIsPlanningCuts(false);
+    }
+  }, [recordedSession, transcript.words]);
 
   // Extract 16kHz audio and request transcription
   const handleGenerateTranscript = async (forceMock: boolean = false) => {
@@ -81,6 +119,12 @@ export default function ScreenForgeStudio() {
         isTranscribing: false,
         error: null,
       });
+
+      // Automatically scan for initial cuts once transcription finishes
+      if (words.length > 0) {
+        const planned = await fetchPlannedCuts(words, recordedSession.durationSeconds);
+        setCuts(planned);
+      }
     } catch (err: unknown) {
       console.error("Transcription error:", err);
       const message = err instanceof Error ? err.message : "Failed to process audio transcript.";
@@ -92,10 +136,26 @@ export default function ScreenForgeStudio() {
     }
   };
 
-  // Video Time Update (Instant DOM-level tracking)
+  // Step 14: Non-destructive preview skip (Skip approved cut ranges without immediately rewriting original file)
   const handleTimeUpdate = () => {
-    if (playbackVideoRef.current) {
-      setCurrentTime(playbackVideoRef.current.currentTime);
+    if (!playbackVideoRef.current) return;
+    const t = playbackVideoRef.current.currentTime;
+    setCurrentTime(t);
+
+    if (!playbackVideoRef.current.paused) {
+      const activeCut = cuts.find(
+        (c) => c.isApplied && t >= c.start && t < c.end
+      );
+
+      if (activeCut) {
+        // Jump cleanly past the cut to prevent infinite seek loops
+        const targetTime = Math.min(playbackVideoRef.current.duration, activeCut.end + 0.02);
+        playbackVideoRef.current.currentTime = targetTime;
+        setSkipNotification(`Skipping cut [${activeCut.words}]`);
+
+        // Clear notification after 1.5s
+        setTimeout(() => setSkipNotification(null), 1500);
+      }
     }
   };
 
@@ -107,24 +167,98 @@ export default function ScreenForgeStudio() {
     }
   };
 
-  // Toggle word cut (strike-through)
+  // Toggle word cut (strike-through) manually in transcript
   const handleToggleCut = (wordId: string) => {
-    setTranscript((prev) => ({
-      ...prev,
-      words: prev.words.map((w) => (w.id === wordId ? { ...w, isCut: !w.isCut } : w)),
-    }));
+    setTranscript((prev) => {
+      const targetWord = prev.words.find((w) => w.id === wordId);
+      if (!targetWord) return prev;
+
+      const newIsCut = !targetWord.isCut;
+
+      // Synchronize with cuts schedule
+      setCuts((prevCuts) => {
+        if (newIsCut) {
+          // Add or enable a cut candidate
+          const existing = prevCuts.find((c) => c.start <= targetWord.start && c.end >= targetWord.end);
+          if (existing) {
+            return prevCuts.map((c) => (c.id === existing.id ? { ...c, isApplied: true } : c));
+          }
+          return [
+            ...prevCuts,
+            {
+              id: `cut-${Date.now()}-${wordId}`,
+              start: targetWord.start,
+              end: targetWord.end,
+              words: targetWord.word,
+              reason: "filler",
+              confidence: 1.0,
+              isApplied: true,
+            },
+          ];
+        } else {
+          // Disable any cut covering this word
+          return prevCuts.map((c) =>
+            targetWord.start >= c.start && targetWord.end <= c.end ? { ...c, isApplied: false } : c
+          );
+        }
+      });
+
+      return {
+        ...prev,
+        words: prev.words.map((w) => (w.id === wordId ? { ...w, isCut: newIsCut } : w)),
+      };
+    });
   };
 
-  // Batch auto-cut fillers
-  const handleBatchCutFillers = () => {
-    setTranscript((prev) => ({
-      ...prev,
-      words: prev.words.map((w) => (w.cutReason === "filler" ? { ...w, isCut: true } : w)),
-    }));
+  // Toggle cut from CutReviewPanel
+  const handleToggleCutCandidate = (cutId: string) => {
+    setCuts((prevCuts) => {
+      const target = prevCuts.find((c) => c.id === cutId);
+      if (!target) return prevCuts;
+
+      const nextApplied = !target.isApplied;
+      const updated = prevCuts.map((c) => (c.id === cutId ? { ...c, isApplied: nextApplied } : c));
+
+      // Reflect into word tokens
+      setTranscript((prev) => ({
+        ...prev,
+        words: prev.words.map((w) => {
+          if (w.start >= target.start - 0.05 && w.end <= target.end + 0.05) {
+            return { ...w, isCut: nextApplied };
+          }
+          return w;
+        }),
+      }));
+
+      return updated;
+    });
   };
 
-  // Restore all cuts
-  const handleRestoreAllCuts = () => {
+  // Apply all or specific cut types
+  const handleApplyAllCuts = (reasonFilter?: string) => {
+    setCuts((prevCuts) => {
+      const updated = prevCuts.map((c) =>
+        reasonFilter ? (c.reason === reasonFilter ? { ...c, isApplied: true } : c) : { ...c, isApplied: true }
+      );
+
+      // Reflect into words
+      setTranscript((prev) => ({
+        ...prev,
+        words: prev.words.map((w) => {
+          const hasActiveCut = updated.some(
+            (c) => c.isApplied && w.start >= c.start - 0.05 && w.end <= c.end + 0.05
+          );
+          return hasActiveCut ? { ...w, isCut: true } : w;
+        }),
+      }));
+
+      return updated;
+    });
+  };
+
+  // Dismiss / deselect all cuts
+  const handleDismissAllCuts = () => {
+    setCuts((prevCuts) => prevCuts.map((c) => ({ ...c, isApplied: false })));
     setTranscript((prev) => ({
       ...prev,
       words: prev.words.map((w) => ({ ...w, isCut: false })),
@@ -140,6 +274,11 @@ export default function ScreenForgeStudio() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
   };
 
+  const appliedCutsCount = cuts.filter((c) => c.isApplied).length;
+  const totalSecondsCut = cuts
+    .filter((c) => c.isApplied)
+    .reduce((acc, c) => acc + (c.end - c.start), 0);
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-indigo-500/30">
       {/* Top Header */}
@@ -154,12 +293,24 @@ export default function ScreenForgeStudio() {
                 ScreenForge AI
               </span>
               <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-medium">
-                Option C • Hybrid
+                Option C • Hybrid (Steps 1–18)
               </span>
             </div>
           </div>
 
           <div className="flex items-center gap-4 text-xs text-zinc-400">
+            {status === "stopped" && recordedSession && (
+              <button
+                onClick={() => setIsExportModalOpen(true)}
+                className="flex items-center gap-2 px-4 py-1.5 rounded-xl bg-gradient-to-r from-indigo-600 to-rose-600 hover:from-indigo-500 hover:to-rose-500 text-white font-medium text-xs shadow-lg shadow-indigo-600/25 transition-all active:scale-95 cursor-pointer"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                Export Video ({appliedCutsCount} cuts)
+              </button>
+            )}
+
             <div className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
               <span>Browser Desk Active</span>
@@ -199,7 +350,7 @@ export default function ScreenForgeStudio() {
                   ScreenForge Recording Desk
                 </h2>
                 <p className="text-sm text-zinc-400 leading-relaxed">
-                  Record your screen and microphone. Once stopped, edit your video by clicking and striking words in the transcript.
+                  Record your screen and microphone. Once stopped, edit your video by striking words in the transcript, preview with non-destructive skipping, and export through FFmpeg.
                 </p>
               </div>
 
@@ -214,11 +365,11 @@ export default function ScreenForgeStudio() {
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>
-                  <span className="text-zinc-300">16kHz Audio Extraction</span>
+                  <span className="text-zinc-300">16kHz Audio Downsampling</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>
-                  <span className="text-zinc-300">Groq Whisper Engine</span>
+                  <span className="text-zinc-300">FFmpeg Export Engine</span>
                 </div>
               </div>
             </div>
@@ -249,12 +400,20 @@ export default function ScreenForgeStudio() {
             </div>
           )}
 
-          {/* STATE 3: STOPPED (Local Material Ready & Side-by-Side Transcript) */}
+          {/* STATE 3: STOPPED (Local Material Ready & Side-by-Side Transcript & Cut Review) */}
           {status === "stopped" && recordedSession && (
             <div className="flex-1 flex flex-col">
               <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 p-4 min-h-[440px]">
-                {/* Left Side: Video Player */}
-                <div className="flex flex-col rounded-2xl bg-black border border-zinc-800 overflow-hidden shadow-md">
+                {/* Left Side: Video Player with Non-destructive Skipping */}
+                <div className="flex flex-col rounded-2xl bg-black border border-zinc-800 overflow-hidden shadow-md relative">
+                  {/* Skip Notification Overlay */}
+                  {skipNotification && (
+                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-full bg-rose-600/90 backdrop-blur-md text-white text-xs font-semibold shadow-lg flex items-center gap-1.5 animate-pulse">
+                      <span>⏩</span>
+                      <span>{skipNotification}</span>
+                    </div>
+                  )}
+
                   <div className="flex-1 flex items-center justify-center bg-black min-h-[300px]">
                     <video
                       ref={playbackVideoRef}
@@ -266,7 +425,7 @@ export default function ScreenForgeStudio() {
                   </div>
 
                   {/* Material Details Bar */}
-                  <div className="p-3 bg-zinc-900 border-t border-zinc-800 flex items-center justify-between text-xs text-zinc-400">
+                  <div className="p-3 bg-zinc-900 border-t border-zinc-800 flex flex-wrap items-center justify-between text-xs text-zinc-400 gap-2">
                     <div className="flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
                       <span className="font-medium text-zinc-200">Original WebM:</span>
@@ -282,21 +441,33 @@ export default function ScreenForgeStudio() {
                       )}
                     </div>
 
-                    <a
-                      href={recordedSession.url}
-                      download={`screenforge_${new Date().toISOString().replace(/[:.]/g, "-")}.webm`}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition-all"
-                    >
-                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                      Download
-                    </a>
+                    <div className="flex items-center gap-2">
+                      <a
+                        href={recordedSession.url}
+                        download={`screenforge_${new Date().toISOString().replace(/[:.]/g, "-")}.webm`}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition-all"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                        Download Raw
+                      </a>
+
+                      <button
+                        onClick={() => setIsExportModalOpen(true)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gradient-to-r from-indigo-600 to-rose-600 hover:from-indigo-500 hover:to-rose-500 text-white text-xs font-medium transition-all shadow-md active:scale-95 cursor-pointer"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                        </svg>
+                        Export Edited (-{totalSecondsCut.toFixed(1)}s)
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                {/* Right Side: Interactive Transcript Grid */}
-                <div className="flex flex-col min-h-[380px]">
+                {/* Right Side: Interactive Transcript & Smart Cut Review */}
+                <div className="flex flex-col gap-4 min-h-[380px]">
                   {transcript.words.length === 0 ? (
                     <div className="flex-1 rounded-2xl bg-zinc-900/60 border border-zinc-800 flex flex-col items-center justify-center p-8 text-center gap-4">
                       <div className="w-12 h-12 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
@@ -359,14 +530,29 @@ export default function ScreenForgeStudio() {
                       </div>
                     </div>
                   ) : (
-                    <TranscriptGrid
-                      words={transcript.words}
-                      currentTime={currentTime}
-                      onSeek={handleSeek}
-                      onToggleCut={handleToggleCut}
-                      onBatchCutFillers={handleBatchCutFillers}
-                      onRestoreAllCuts={handleRestoreAllCuts}
-                    />
+                    <div className="flex flex-col gap-4 flex-1">
+                      {/* Transcript text grid */}
+                      <div className="flex-1">
+                        <TranscriptGrid
+                          words={transcript.words}
+                          currentTime={currentTime}
+                          onSeek={handleSeek}
+                          onToggleCut={handleToggleCut}
+                          onBatchCutFillers={() => handleApplyAllCuts("filler")}
+                          onRestoreAllCuts={handleDismissAllCuts}
+                        />
+                      </div>
+
+                      {/* Smart Cut Suggestions Panel */}
+                      <CutReviewPanel
+                        cuts={cuts}
+                        onToggleCut={handleToggleCutCandidate}
+                        onApplyAll={handleApplyAllCuts}
+                        onDismissAll={handleDismissAllCuts}
+                        onPlanCuts={handleScanForCuts}
+                        isLoading={isPlanningCuts}
+                      />
+                    </div>
                   )}
                 </div>
               </div>
@@ -386,6 +572,15 @@ export default function ScreenForgeStudio() {
           onReset={handleReset}
         />
       </main>
+
+      {/* FFmpeg Export Modal */}
+      <ExportModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        videoBlob={recordedSession?.blob || null}
+        durationSeconds={recordedSession?.durationSeconds || 0}
+        cuts={cuts}
+      />
     </div>
   );
 }

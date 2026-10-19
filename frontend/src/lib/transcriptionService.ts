@@ -1,8 +1,8 @@
-import { WordToken } from "@/types/transcript";
+import { WordToken, CutCandidate } from "@/types/transcript";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-const COMMON_FILLERS = new Set(["um", "uh", "er", "ah", "hmm"]);
+const COMMON_FILLERS = new Set(["um", "uh", "er", "ah", "hmm", "like", "actually", "basically"]);
 
 function isFillerWord(word: string): boolean {
   const clean = word.toLowerCase().replace(/[^a-z]/g, "");
@@ -59,8 +59,7 @@ export function generateMockTranscript(durationSeconds: number): WordToken[] {
 }
 
 /**
- * Request real transcription from backend using Groq Whisper,
- * or surface clear setup instructions if key is missing.
+ * Request real transcription from backend using Groq Whisper.
  */
 export async function fetchTranscription(
   audioBlob: Blob,
@@ -106,6 +105,119 @@ export async function fetchTranscription(
     }));
   }
 
-  // If no words detected (e.g. silent recording)
   return [];
+}
+
+/**
+ * Plan cuts using backend rules engine (fillers, silence pauses, repetitions)
+ * with strict timestamp validation against media duration.
+ */
+export async function fetchPlannedCuts(
+  words: WordToken[],
+  durationSeconds: number
+): Promise<CutCandidate[]> {
+  const payload = {
+    media_duration_seconds: durationSeconds,
+    words: words.map((w) => ({ text: w.word, start: w.start, end: w.end })),
+    settings: {
+      detect_fillers: true,
+      detect_silence: true,
+      min_silence_seconds: 0.8,
+      detect_repetitions: true,
+    },
+  };
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/plan-cuts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || "Failed to plan cuts.");
+    }
+
+    const data = await res.json();
+    return (data.cuts || []).map((c: { start: number; end: number; words: string; reason: string; confidence: number }, idx: number) => ({
+      id: `cut-${idx}-${Date.now()}`,
+      start: c.start,
+      end: c.end,
+      words: c.words,
+      reason: c.reason as CutCandidate["reason"],
+      confidence: c.confidence,
+      isApplied: true,
+    }));
+  } catch (error) {
+    console.error("Cut planning error:", error);
+    // Fallback: local rules
+    const fallbackCuts: CutCandidate[] = [];
+    words.forEach((w, idx) => {
+      if (isFillerWord(w.word)) {
+        fallbackCuts.push({
+          id: `cut-fallback-${idx}`,
+          start: w.start,
+          end: w.end,
+          words: w.word,
+          reason: "filler",
+          confidence: 0.9,
+          isApplied: true,
+        });
+      }
+    });
+    return fallbackCuts;
+  }
+}
+
+/**
+ * Request server-side FFmpeg rendering for the final export.
+ */
+export async function exportVideoFFmpeg(
+  videoBlob: Blob,
+  durationSeconds: number,
+  cuts: CutCandidate[]
+): Promise<{
+  exportId: string;
+  downloadUrl: string;
+  originalDuration: number;
+  finalDuration: number;
+  cutsAppliedCount: number;
+  fileSizeBytes: number;
+}> {
+  const formData = new FormData();
+  formData.append("file", videoBlob, "recording.webm");
+  formData.append("duration", durationSeconds.toString());
+  formData.append(
+    "cuts_json",
+    JSON.stringify(
+      cuts.map((c) => ({
+        start: c.start,
+        end: c.end,
+        words: c.words,
+        reason: c.reason,
+        confidence: c.confidence,
+      }))
+    )
+  );
+
+  const res = await fetch(`${BACKEND_URL}/api/export`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Server export failed with status ${res.status}`);
+  }
+
+  const data = await res.json();
+  return {
+    exportId: data.export_id,
+    downloadUrl: `${BACKEND_URL}${data.download_url}`,
+    originalDuration: data.original_duration,
+    finalDuration: data.final_duration,
+    cutsAppliedCount: data.cuts_applied_count,
+    fileSizeBytes: data.file_size_bytes,
+  };
 }
