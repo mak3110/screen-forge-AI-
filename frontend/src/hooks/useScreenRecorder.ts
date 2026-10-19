@@ -297,6 +297,14 @@ export function useScreenRecorder() {
     }
   }, [monitorAudioLevel, releaseStreams]);
 
+  // Restore an existing recorded session from persistent storage
+  const restoreSession = useCallback((session: RecordedSession) => {
+    setRecordedSession(session);
+    setElapsedSeconds(session.durationSeconds);
+    elapsedSecondsRef.current = session.durationSeconds;
+    setStatus("stopped");
+  }, []);
+
   // Reset to record again
   const resetRecording = useCallback(() => {
     if (recordedSession?.url) {
@@ -331,5 +339,6 @@ export function useScreenRecorder() {
     resumeRecording,
     stopRecording,
     resetRecording,
+    restoreSession,
   };
 }

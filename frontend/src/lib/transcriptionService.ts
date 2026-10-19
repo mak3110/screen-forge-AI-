@@ -1,6 +1,14 @@
 import { WordToken, CutCandidate } from "@/types/transcript";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+function resolveBackendUrl(): string {
+  const raw = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    return raw.replace(/\/$/, "");
+  }
+  return `https://${raw}`.replace(/\/$/, "");
+}
+
+const BACKEND_URL = resolveBackendUrl();
 
 const COMMON_FILLERS = new Set(["um", "uh", "er", "ah", "hmm", "like", "actually", "basically"]);
 

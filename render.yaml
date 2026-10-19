@@ -1,0 +1,38 @@
+services:
+  # ScreenForge AI FastAPI Backend Worker
+  - type: web
+    name: screenforge-backend
+    env: python
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: "http://localhost:3000"
+      - key: TEMP_STORAGE_DIR
+        value: "./temp_storage"
+      - key: CLEANUP_RETENTION_MINUTES
+        value: "60"
+
+  # ScreenForge AI Next.js Frontend
+  - type: web
+    name: screenforge-frontend
+    env: node
+    plan: free
+    region: oregon
+    rootDir: frontend
+    buildCommand: "npm install && npm run build"
+    startCommand: "npm run start"
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: screenforge-backend
+          property: host

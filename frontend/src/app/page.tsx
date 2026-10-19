@@ -8,6 +8,11 @@ import { CutReviewPanel } from "@/components/CutReviewPanel";
 import { ExportModal } from "@/components/ExportModal";
 import { extract16kHzMonoWav } from "@/lib/audioProcessing";
 import { fetchTranscription, fetchPlannedCuts } from "@/lib/transcriptionService";
+import {
+  saveDraftToIndexedDB,
+  loadDraftFromIndexedDB,
+  clearDraftFromIndexedDB,
+} from "@/lib/storage";
 import { TranscriptState, CutCandidate } from "@/types/transcript";
 
 export default function ScreenForgeStudio() {
@@ -23,6 +28,7 @@ export default function ScreenForgeStudio() {
     resumeRecording,
     stopRecording,
     resetRecording,
+    restoreSession,
   } = useScreenRecorder();
 
   // Video references
@@ -41,6 +47,7 @@ export default function ScreenForgeStudio() {
   const [cuts, setCuts] = useState<CutCandidate[]>([]);
   const [isPlanningCuts, setIsPlanningCuts] = useState<boolean>(false);
   const [skipNotification, setSkipNotification] = useState<string | null>(null);
+  const [restoredNotice, setRestoredNotice] = useState<string | null>(null);
 
   // Export modal state (Steps 15-18)
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
@@ -55,13 +62,65 @@ export default function ScreenForgeStudio() {
     }
   }, [screenStream, status]);
 
-  // Clean transcript when resetting
+  // Restore draft from IndexedDB on initial mount
+  useEffect(() => {
+    async function restoreDraft() {
+      const draft = await loadDraftFromIndexedDB();
+      if (draft && draft.videoBlob) {
+        const url = URL.createObjectURL(draft.videoBlob);
+        restoreSession({
+          blob: draft.videoBlob,
+          url,
+          durationSeconds: draft.durationSeconds,
+          mimeType: draft.videoBlob.type || "video/webm",
+          sizeBytes: draft.sizeBytes,
+          timestamp: draft.savedAt,
+        });
+
+        if (draft.transcriptWords && draft.transcriptWords.length > 0) {
+          setTranscript({
+            words: draft.transcriptWords,
+            isTranscribing: false,
+            error: null,
+          });
+        }
+        if (draft.cuts && draft.cuts.length > 0) {
+          setCuts(draft.cuts);
+        }
+        if (draft.extractedAudioSize) {
+          setExtractedAudioSize(draft.extractedAudioSize);
+        }
+        setRestoredNotice(
+          `Restored unsaved session from draft (${draft.durationSeconds.toFixed(1)}s, ${(draft.sizeBytes / (1024 * 1024)).toFixed(1)} MB)`
+        );
+      }
+    }
+    restoreDraft();
+  }, [restoreSession]);
+
+  // Automatically persist session and editor state to IndexedDB whenever it changes
+  useEffect(() => {
+    if (status === "stopped" && recordedSession?.blob) {
+      saveDraftToIndexedDB({
+        videoBlob: recordedSession.blob,
+        durationSeconds: recordedSession.durationSeconds,
+        sizeBytes: recordedSession.sizeBytes,
+        transcriptWords: transcript.words,
+        cuts,
+        extractedAudioSize,
+      });
+    }
+  }, [status, recordedSession, transcript.words, cuts, extractedAudioSize]);
+
+  // Clean transcript & IndexedDB when resetting
   const handleReset = () => {
+    clearDraftFromIndexedDB();
     setTranscript({ words: [], isTranscribing: false, error: null });
     setCuts([]);
     setExtractedAudioSize(null);
     setCurrentTime(0);
     setSkipNotification(null);
+    setRestoredNotice(null);
     resetRecording();
   };
 
@@ -330,6 +389,31 @@ export default function ScreenForgeStudio() {
             <div className="text-sm">
               <span className="font-semibold">{error.type === "permission_denied" ? "Permission Denied: " : "Error: "}</span>
               {error.message}
+            </div>
+          </div>
+        )}
+
+        {/* Restored Session Notification */}
+        {restoredNotice && status === "stopped" && (
+          <div className="p-3.5 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-200 flex items-center justify-between text-xs backdrop-blur-sm">
+            <div className="flex items-center gap-2.5">
+              <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"></span>
+              <span className="font-medium text-white">Draft Restored:</span>
+              <span>{restoredNotice}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setRestoredNotice(null)}
+                className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[11px] transition-colors cursor-pointer"
+              >
+                Dismiss
+              </button>
+              <button
+                onClick={handleReset}
+                className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[11px] border border-rose-500/30 transition-colors cursor-pointer"
+              >
+                Discard Draft
+              </button>
             </div>
           </div>
         )}
