@@ -1,14 +1,25 @@
 import { WordToken, CutCandidate } from "@/types/transcript";
 
-function resolveBackendUrl(): string {
-  const raw = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-  if (raw.startsWith("http://") || raw.startsWith("https://")) {
-    return raw.replace(/\/$/, "");
+export function getBackendUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl && !envUrl.includes("localhost")) {
+    if (envUrl.startsWith("http://") || envUrl.startsWith("https://")) {
+      return envUrl.replace(/\/$/, "");
+    }
+    return `https://${envUrl}`.replace(/\/$/, "");
   }
-  return `https://${raw}`.replace(/\/$/, "");
-}
 
-const BACKEND_URL = resolveBackendUrl();
+  // Auto-detect production cloud deployment (Vercel) and route to Render backend
+  if (
+    typeof window !== "undefined" &&
+    window.location.hostname !== "localhost" &&
+    window.location.hostname !== "127.0.0.1"
+  ) {
+    return "https://screen-forge-ai.onrender.com";
+  }
+
+  return "http://localhost:8000";
+}
 
 const COMMON_FILLERS = new Set(["um", "uh", "er", "ah", "hmm", "like", "actually", "basically"]);
 
@@ -83,15 +94,16 @@ export async function fetchTranscription(
   formData.append("file", audioBlob, "recording.wav");
   formData.append("duration", durationSeconds.toString());
 
+  const backendUrl = getBackendUrl();
   let response: Response;
   try {
-    response = await fetch(`${BACKEND_URL}/api/transcribe`, {
+    response = await fetch(`${backendUrl}/api/transcribe`, {
       method: "POST",
       body: formData,
     });
   } catch {
     throw new Error(
-      "Could not connect to ScreenForge backend at http://localhost:8000. Is the backend server running?"
+      `Could not connect to ScreenForge backend at ${backendUrl}. If deployed on Render free tier, the backend may take 30-60s to wake up on first request. Please wait a moment and click retry.`
     );
   }
 
@@ -135,8 +147,9 @@ export async function fetchPlannedCuts(
     },
   };
 
+  const backendUrl = getBackendUrl();
   try {
-    const res = await fetch(`${BACKEND_URL}/api/plan-cuts`, {
+    const res = await fetch(`${backendUrl}/api/plan-cuts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -209,7 +222,8 @@ export async function exportVideoFFmpeg(
     )
   );
 
-  const res = await fetch(`${BACKEND_URL}/api/export`, {
+  const backendUrl = getBackendUrl();
+  const res = await fetch(`${backendUrl}/api/export`, {
     method: "POST",
     body: formData,
   });
@@ -222,7 +236,7 @@ export async function exportVideoFFmpeg(
   const data = await res.json();
   return {
     exportId: data.export_id,
-    downloadUrl: `${BACKEND_URL}${data.download_url}`,
+    downloadUrl: `${backendUrl}${data.download_url}`,
     originalDuration: data.original_duration,
     finalDuration: data.final_duration,
     cutsAppliedCount: data.cuts_applied_count,
