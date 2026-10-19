@@ -1,24 +1,25 @@
 import { WordToken, CutCandidate } from "@/types/transcript";
 
 export function getBackendUrl(): string {
-  const envUrl = process.env.NEXT_PUBLIC_API_URL;
-  if (envUrl && !envUrl.includes("localhost")) {
-    if (envUrl.startsWith("http://") || envUrl.startsWith("https://")) {
-      return envUrl.replace(/\/$/, "");
-    }
-    return `https://${envUrl}`.replace(/\/$/, "");
-  }
-
-  // Auto-detect production cloud deployment (Vercel) and route to Render backend
+  // If running locally in browser
   if (
     typeof window !== "undefined" &&
-    window.location.hostname !== "localhost" &&
-    window.location.hostname !== "127.0.0.1"
+    (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
   ) {
-    return "https://screen-forge-ai.onrender.com";
+    return "http://localhost:8000";
   }
 
-  return "http://localhost:8000";
+  let raw = (process.env.NEXT_PUBLIC_API_URL || "").trim();
+
+  // Strip accidental repeated protocols, spaces, and trailing slashes
+  raw = raw.replace(/^(https?:\/\/|\s)+/gi, "").replace(/\/+$/, "").trim();
+
+  if (raw && !raw.includes("localhost")) {
+    return `https://${raw}`;
+  }
+
+  // Live cloud fallback
+  return "https://screen-forge-ai.onrender.com";
 }
 
 const COMMON_FILLERS = new Set(["um", "uh", "er", "ah", "hmm", "like", "actually", "basically"]);
